@@ -18,13 +18,14 @@ from spacy.util import minibatch
 from torch.utils.data import DataLoader, random_split
 from pytorch_lightning.callbacks.base import Callback
 
-from models import bert, lstm_glove, lstm_toy, roberta, t5, gpt2
+from models import bert, lstm_glove, lstm_toy, roberta, t5, gpt2, nli_models
 
 
 @plac.opt(
     "prop",
     "property name",
     choices=[
+        "nli_base_overlap",
         "gap-base-length",
         "gap-base-plural",
         "gap-hard-length",
@@ -75,9 +76,9 @@ from models import bert, lstm_glove, lstm_toy, roberta, t5, gpt2
 @plac.opt(
     "seed", "which rand seed to use", type=int,
 )
-@plac.opt(
-    "wandb_entity", "wandb entity. set WANDB_API_KEY (in script or bashrc) to use."
-)
+# @plac.opt(
+#     "wandb_entity", "wandb entity. set WANDB_API_KEY (in script or bashrc) to use."
+# )
 def main(
     prop="sva",
     rate=0,
@@ -85,7 +86,7 @@ def main(
     task="finetune",
     model="bert-base-uncased",
     seed=1,
-    wandb_entity="bert-syntax",
+    # wandb_entity="bert-syntax",
 ):
     """Trains and evaluates model.
 
@@ -150,11 +151,16 @@ def main(
     # `export WANDB_API_KEY=62831853071795864769252867665590057683943`.
     config = dict(prop=prop, rate=rate, probe=probe, task=task, model=model, seed=seed)
 
-    wandb_logger = WandbLogger(entity=wandb_entity, project="features")
-    wandb_logger.log_hyperparams(config)
-    train_data, eval_data, test_data = load_data(
-        prop, path, label_col, [positive_label, negative_label]
-    )
+    # wandb_logger = WandbLogger(entity=wandb_entity, project="features")
+    # wandb_logger.log_hyperparams(config)
+    if prop[:3] == "nli":
+        train_data, eval_data, test_data = load_nli_data(
+            prop, path, label_col, [positive_label, negative_label]
+        )
+    else:
+        train_data, eval_data, test_data = load_data(
+            prop, path, label_col, [positive_label, negative_label]
+        )
     num_steps = (len(train_data) // batch_size) * num_epochs
     datamodule = DataModule(batch_size, train_data, eval_data, test_data)
 
@@ -163,11 +169,15 @@ def main(
     limit_val_batches = max(0.1, 1 / len(datamodule.val_dataloader()))
     val_check_interval = max(0.1, 1 / len(datamodule.val_dataloader()))
 
-    classifier = load_model(model, num_steps)
+    if prop[:3] == "nli":
+        classifier = load_nli_model(model, num_steps)
+    else:
+        classifier = load_model(model, num_steps)
+
     lossauc = LossAuc()
     trainer = Trainer(
         gpus=1 if spacy.prefer_gpu() else 0,
-        logger=wandb_logger,
+        # logger=wandb_logger,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         limit_test_batches=limit_test_batches,
@@ -300,6 +310,48 @@ def load_data(prop, path, label_col, categories):
 
     return train_data, eval_data, test_data
 
+def load_nli_data(prop, path, label_col, categories):
+    """Load data from the IMDB dataset, splitting off a held-out set."""
+    # SHUFFLE
+    trn = (
+        pd.read_table(f"./properties/{prop}/{path}_train.tsv")
+        .sample(frac=1)
+        .reset_index(drop=True)
+    )
+    val = (
+        pd.read_table(f"./properties/{prop}/{path}_val.tsv")
+        .sample(frac=1)
+        .reset_index(drop=True)
+    )
+    # NO SHUFFLE (so we can re-align the results with the input data.)
+    tst = pd.read_table(f"./properties/{prop}/test.tsv")
+
+    # SPLIT & PREPARE
+    trn_p, trn_h, trn_lbl = (
+        trn.premise.tolist(),
+        trn.hypothesis.tolist(),
+        prepare_labels_pytorch(trn[label_col].tolist()),
+    )
+    val_p, val_h, val_lbl = (
+        val.premise.tolist(),
+        val.hypothesis.tolist(),
+        prepare_labels_pytorch(val[label_col].tolist()),
+    )
+    tst_p, tst_h, tst_lbl = (
+        tst.premise.tolist(),
+        tst.hypothesis.tolist(),
+        prepare_labels_pytorch(tst[label_col].tolist()),
+    )
+
+    train_data = list(zip(trn_p, trn_h, trn_lbl))
+    eval_data = list(zip(val_p, val_h, val_lbl))
+    test_data = list(zip(tst_p, tst_h, tst_lbl))
+    print("train", len(train_data))
+    print("val", len(eval_data))
+    print("test", len(test_data))
+
+    return train_data, eval_data, test_data
+
 
 def load_model(model, num_steps):
     """Loads appropriate model & optimizer (& optionally lr scheduler.)
@@ -326,6 +378,17 @@ def load_model(model, num_steps):
 
     assert f"model `{model}` not found."
 
+def load_nli_model(model, num_steps):
+    """Loads appropriate model & optimizer (& optionally lr scheduler.)
+
+    Parameters
+    ----------
+    model : ``str``
+        model string. in most cases, a hugging face model code.
+    num_steps : ``int``
+        number of update steps. optionally used for lr schedules.
+    """
+    return nli_models.NLIClassifier(model, num_steps)
 
 def finetune_evaluation(df, label_col):
     """Compute additional evaluation.
